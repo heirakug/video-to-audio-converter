@@ -12,8 +12,131 @@ export default function VideoToAudioConverter() {
   const [fileName, setFileName] = useState<string>('');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [statusMessage, setStatusMessage] = useState<string>('');
+  const [isCached, setIsCached] = useState<boolean>(false);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const ffmpegRef = useRef<any>(null);
   const messageRef = useRef<HTMLDivElement>(null);
+
+  // ローカルストレージキー
+  const FFMPEG_CACHE_KEY = 'ffmpeg_cache_status';
+  const FFMPEG_VERSION_KEY = 'ffmpeg_version';
+  const CURRENT_VERSION = '0.12.6';
+
+  // IndexedDBでFFmpegファイルをキャッシュ
+  const openDB = (): Promise<IDBDatabase> => {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open('FFmpegCache', 1);
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains('files')) {
+          db.createObjectStore('files', { keyPath: 'name' });
+        }
+      };
+    });
+  };
+
+  // キャッシュからファイルを取得
+  const getCachedFile = async (fileName: string): Promise<Uint8Array | null> => {
+    try {
+      const db = await openDB();
+      const transaction = db.transaction(['files'], 'readonly');
+      const store = transaction.objectStore('files');
+      const request = store.get(fileName);
+      
+      return new Promise((resolve, reject) => {
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => {
+          const result = request.result;
+          if (result && result.version === CURRENT_VERSION) {
+            resolve(new Uint8Array(result.data));
+          } else {
+            resolve(null);
+          }
+        };
+      });
+    } catch (error) {
+      console.warn('Failed to get cached file:', error);
+      return null;
+    }
+  };
+
+  // ファイルをキャッシュに保存
+  const setCachedFile = async (fileName: string, data: Uint8Array): Promise<void> => {
+    try {
+      const db = await openDB();
+      const transaction = db.transaction(['files'], 'readwrite');
+      const store = transaction.objectStore('files');
+      await store.put({
+        name: fileName,
+        data: Array.from(data),
+        version: CURRENT_VERSION,
+        timestamp: Date.now()
+      });
+    } catch (error) {
+      console.warn('Failed to cache file:', error);
+    }
+  };
+
+  // キャッシュ状態をチェック
+  const checkCache = async (): Promise<boolean> => {
+    try {
+      const coreFile = await getCachedFile('ffmpeg-core.wasm');
+      const wasmFile = await getCachedFile('ffmpeg-core.js');
+      return coreFile !== null && wasmFile !== null;
+    } catch {
+      return false;
+    }
+  };
+
+  // キャッシュ状態を保存
+  const saveCache = () => {
+    try {
+      localStorage.setItem(FFMPEG_VERSION_KEY, CURRENT_VERSION);
+      localStorage.setItem(FFMPEG_CACHE_KEY, 'loaded');
+    } catch (error) {
+      console.warn('Failed to save cache status:', error);
+    }
+  };
+
+  // キャッシュをクリア
+  const clearCache = async () => {
+    try {
+      localStorage.removeItem(FFMPEG_VERSION_KEY);
+      localStorage.removeItem(FFMPEG_CACHE_KEY);
+      
+      // IndexedDBのキャッシュもクリア
+      const db = await openDB();
+      const transaction = db.transaction(['files'], 'readwrite');
+      const store = transaction.objectStore('files');
+      await store.clear();
+      
+      setIsCached(false);
+      console.log('✅ Cache cleared successfully');
+    } catch (error) {
+      console.warn('Failed to clear cache:', error);
+    }
+  };
+
+  // 初期化時にキャッシュ状態をチェック
+  useEffect(() => {
+    const initCache = async () => {
+      const cached = await checkCache();
+      setIsCached(cached);
+      if (cached) {
+        setStatusMessage('キャッシュからFFmpegを自動読み込み中...');
+        // キャッシュがある場合は自動でFFmpegを読み込み
+        try {
+          await load();
+        } catch (error) {
+          console.error('Auto-load failed:', error);
+          setStatusMessage('自動読み込みに失敗しました。手動で読み込んでください。');
+        }
+      }
+    };
+    initCache();
+  }, []);
 
   const load = async () => {
     try {
@@ -44,41 +167,75 @@ export default function VideoToAudioConverter() {
       console.log('🌐 Using BASE_URL:', BASE_URL);
       
       console.log('📋 Setting up event listeners...');
-      ffmpeg.on('log', ({ message }: any) => {
+      ffmpeg.on('log', ({ message }: { message: string }) => {
         console.log('📝 FFmpeg log:', message);
         if (messageRef.current) {
           messageRef.current.innerHTML = message;
         }
       });
 
-      ffmpeg.on('progress', ({ progress }: any) => {
+      ffmpeg.on('progress', ({ progress }: { progress: number }) => {
         console.log('📊 FFmpeg progress:', progress);
         setProgress(Math.round(progress * 100));
       });
 
-      console.log('🔽 Loading FFmpeg core files...');
-      
-      // ファイルを個別に取得してエラーハンドリング
-      let coreURL, wasmURL;
-      
-      try {
-        console.log('  - Loading core.js...');
-        setStatusMessage('FFmpegコアファイルを読み込んでいます...');
-        coreURL = await toBlobURL(`${BASE_URL}/ffmpeg-core.js`, 'text/javascript');
-        console.log('  - Core.js loaded:', coreURL);
-      } catch (error) {
-        console.error('❌ Failed to load ffmpeg-core.js:', error);
-        throw new Error('Cannot load ffmpeg-core.js from CDN');
-      }
-      
-      try {
-        console.log('  - Loading core.wasm...');
-        setStatusMessage('FFmpeg WebAssemblyを読み込んでいます...');
-        wasmURL = await toBlobURL(`${BASE_URL}/ffmpeg-core.wasm`, 'application/wasm');
-        console.log('  - Core.wasm loaded:', wasmURL);
-      } catch (error) {
-        console.error('❌ Failed to load ffmpeg-core.wasm:', error);
-        throw new Error('Cannot load ffmpeg-core.wasm from CDN');
+      // キャッシュから読み込みを試行
+      console.log('⚡ Checking cache...');
+      const cachedCore = await getCachedFile('ffmpeg-core.js');
+      const cachedWasm = await getCachedFile('ffmpeg-core.wasm');
+
+      let coreURL: string;
+      let wasmURL: string;
+
+      if (cachedCore && cachedWasm) {
+        console.log('🎯 Using cached files!');
+        setStatusMessage('キャッシュからFFmpegを読み込んでいます（高速）...');
+        
+        // キャッシュされたファイルからBlobURLを作成
+        coreURL = URL.createObjectURL(new Blob([cachedCore], { type: 'text/javascript' }));
+        wasmURL = URL.createObjectURL(new Blob([cachedWasm], { type: 'application/wasm' }));
+        
+        console.log('✅ Cache URLs created');
+      } else {
+        console.log('🔽 Downloading FFmpeg core files...');
+        setStatusMessage('FFmpegコアファイルをダウンロードしています（初回のみ）...');
+
+        try {
+          console.log('  - Loading core.js...');
+          coreURL = await toBlobURL(`${BASE_URL}/ffmpeg-core.js`, 'text/javascript');
+          console.log('  - Core.js loaded');
+        } catch (error) {
+          console.error('❌ Failed to load ffmpeg-core.js:', error);
+          throw new Error('Cannot load ffmpeg-core.js from CDN');
+        }
+        
+        try {
+          console.log('  - Loading core.wasm...');
+          wasmURL = await toBlobURL(`${BASE_URL}/ffmpeg-core.wasm`, 'application/wasm');
+          console.log('  - Core.wasm loaded');
+        } catch (error) {
+          console.error('❌ Failed to load ffmpeg-core.wasm:', error);
+          throw new Error('Cannot load ffmpeg-core.wasm from CDN');
+        }
+
+        // ダウンロードしたファイルをキャッシュに保存
+        try {
+          console.log('💾 Saving to cache...');
+          const coreResponse = await fetch(coreURL);
+          const wasmResponse = await fetch(wasmURL);
+          
+          if (coreResponse.ok && wasmResponse.ok) {
+            const coreData = new Uint8Array(await coreResponse.arrayBuffer());
+            const wasmData = new Uint8Array(await wasmResponse.arrayBuffer());
+            
+            await setCachedFile('ffmpeg-core.js', coreData);
+            await setCachedFile('ffmpeg-core.wasm', wasmData);
+            
+            console.log('✅ Files cached successfully');
+          }
+        } catch (error) {
+          console.warn('Failed to cache files:', error);
+        }
       }
 
       console.log('🎯 Calling ffmpeg.load()...');
@@ -93,13 +250,17 @@ export default function VideoToAudioConverter() {
       setStatusMessage('FFmpegの読み込みが完了しました！');
       console.log('🎉 FFmpeg is ready to use!');
       
+      // キャッシュ状態を保存
+      saveCache();
+      setIsCached(true);
+      
     } catch (error) {
       console.error('❌ Error during FFmpeg load:', error);
       setStatusMessage('FFmpegの読み込みに失敗しました。再試行してください。');
       console.error('Error details:', {
-        name: error?.name,
-        message: error?.message,
-        stack: error?.stack,
+        name: (error as Error)?.name,
+        message: (error as Error)?.message,
+        stack: (error as Error)?.stack,
       });
       throw error;
     } finally {
@@ -261,19 +422,48 @@ export default function VideoToAudioConverter() {
         
         {!isReady && (
           <div className="text-center mb-6">
-            <button
-              onClick={load}
-              disabled={isFFmpegLoading}
-              className="bg-blue-500 hover:bg-blue-600 disabled:bg-blue-300 disabled:cursor-not-allowed text-white font-bold py-3 px-6 rounded-lg transition-colors cursor-pointer"
-            >
-              {isFFmpegLoading ? '読み込み中...' : 'FFmpegを読み込む'}
-            </button>
-            <p className="text-sm text-gray-600 mt-2">
-              初回またはページリロード時にFFmpegの読み込みが必要です（約10MB、2回目以降はキャッシュで高速化）
-            </p>
+            {/* キャッシュがない場合のみボタンを表示 */}
+            {!isCached && (
+              <>
+                <button
+                  onClick={load}
+                  disabled={isFFmpegLoading}
+                  className="bg-blue-500 hover:bg-blue-600 disabled:bg-blue-300 disabled:cursor-not-allowed text-white font-bold py-3 px-6 rounded-lg transition-colors cursor-pointer"
+                >
+                  {isFFmpegLoading ? '読み込み中...' : 'FFmpegを読み込む'}
+                </button>
+                <p className="text-sm text-gray-600 mt-2">
+                  初回のFFmpegダウンロードが必要です（約10MB、次回以降はキャッシュで瞬時起動）
+                </p>
+              </>
+            )}
+            
+            {/* キャッシュがある場合は自動読み込み状態を表示 */}
+            {isCached && isFFmpegLoading && (
+              <div className="animate-pulse">
+                <div className="w-16 h-16 mx-auto mb-4 bg-blue-100 rounded-full flex items-center justify-center">
+                  <div className="w-8 h-8 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                </div>
+                <p className="text-blue-600 font-medium">キャッシュからFFmpegを自動読み込み中...</p>
+              </div>
+            )}
+            
             {statusMessage && (
               <div className="mt-3 p-2 bg-blue-50 border border-blue-200 rounded text-blue-700 text-sm">
                 {statusMessage}
+              </div>
+            )}
+            
+            {/* キャッシュクリアボタンは常に表示（トラブルシューティング用） */}
+            {isCached && !isFFmpegLoading && (
+              <div className="mt-3 p-2 bg-green-50 border border-green-200 rounded text-green-700 text-sm flex items-center justify-between">
+                <span>⚡ FFmpegキャッシュ済み（自動読み込み中...）</span>
+                <button
+                  onClick={clearCache}
+                  className="text-xs bg-green-100 hover:bg-green-200 px-2 py-1 rounded transition-colors"
+                >
+                  キャッシュクリア
+                </button>
               </div>
             )}
           </div>
@@ -298,7 +488,7 @@ export default function VideoToAudioConverter() {
             </div>
 
             {/* エラーメッセージ表示 */}
-            {statusMessage && !selectedFile && !isLoading && (
+            {statusMessage && !selectedFile && !isLoading && !isReady && statusMessage.includes('失敗') && (
               <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg">
                 <h3 className="text-lg font-semibold text-red-800 mb-2">
                   ⚠️ ファイルエラー
