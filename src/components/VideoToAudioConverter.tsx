@@ -13,6 +13,7 @@ export default function VideoToAudioConverter() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [isCached, setIsCached] = useState<boolean>(false);
+  const [mounted, setMounted] = useState<boolean>(false);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const ffmpegRef = useRef<any>(null);
   const messageRef = useRef<HTMLDivElement>(null);
@@ -22,9 +23,35 @@ export default function VideoToAudioConverter() {
   const FFMPEG_VERSION_KEY = 'ffmpeg_version';
   const CURRENT_VERSION = '0.12.6';
 
+  // ストレージ可用性チェック
+  const isStorageAvailable = (type: 'localStorage' | 'indexedDB' | 'cacheAPI'): boolean => {
+    try {
+      switch (type) {
+        case 'localStorage':
+          const test = '__storage_test__';
+          localStorage.setItem(test, test);
+          localStorage.removeItem(test);
+          return true;
+        case 'indexedDB':
+          return 'indexedDB' in window && indexedDB !== null;
+        case 'cacheAPI':
+          return 'caches' in window;
+        default:
+          return false;
+      }
+    } catch {
+      return false;
+    }
+  };
+
   // IndexedDBでFFmpegファイルをキャッシュ
   const openDB = (): Promise<IDBDatabase> => {
     return new Promise((resolve, reject) => {
+      if (!isStorageAvailable('indexedDB')) {
+        reject(new Error('IndexedDB not available'));
+        return;
+      }
+      
       const request = indexedDB.open('FFmpegCache', 1);
       request.onerror = () => reject(request.error);
       request.onsuccess = () => resolve(request.result);
@@ -37,55 +64,129 @@ export default function VideoToAudioConverter() {
     });
   };
 
-  // キャッシュからファイルを取得
-  const getCachedFile = async (fileName: string): Promise<Uint8Array | null> => {
+  // Cache APIを使用したキャッシュ取得（フォールバック）
+  const getCachedFileFromCacheAPI = async (fileName: string): Promise<Uint8Array | null> => {
     try {
-      const db = await openDB();
-      const transaction = db.transaction(['files'], 'readonly');
-      const store = transaction.objectStore('files');
-      const request = store.get(fileName);
+      if (!isStorageAvailable('cacheAPI')) {
+        return null;
+      }
       
-      return new Promise((resolve, reject) => {
-        request.onerror = () => reject(request.error);
-        request.onsuccess = () => {
-          const result = request.result;
-          if (result && result.version === CURRENT_VERSION) {
-            resolve(new Uint8Array(result.data));
-          } else {
-            resolve(null);
-          }
-        };
-      });
+      const cache = await caches.open('ffmpeg-cache-v1');
+      const response = await cache.match(`/ffmpeg/${fileName}`);
+      
+      if (response) {
+        const buffer = await response.arrayBuffer();
+        return new Uint8Array(buffer);
+      }
+      return null;
     } catch (error) {
-      console.warn('Failed to get cached file:', error);
+      console.warn('Failed to get cached file from Cache API:', error);
       return null;
     }
   };
 
-  // ファイルをキャッシュに保存
-  const setCachedFile = async (fileName: string, data: Uint8Array): Promise<void> => {
+  // キャッシュからファイルを取得（複数の方法を試行）
+  const getCachedFile = async (fileName: string): Promise<Uint8Array | null> => {
+    // 1. IndexedDBから取得を試行
     try {
-      const db = await openDB();
-      const transaction = db.transaction(['files'], 'readwrite');
-      const store = transaction.objectStore('files');
-      await store.put({
-        name: fileName,
-        data: Array.from(data),
-        version: CURRENT_VERSION,
-        timestamp: Date.now()
-      });
+      if (isStorageAvailable('indexedDB')) {
+        const db = await openDB();
+        const transaction = db.transaction(['files'], 'readonly');
+        const store = transaction.objectStore('files');
+        const request = store.get(fileName);
+        
+        const result = await new Promise<{name: string; data: number[]; version: string; timestamp: number} | undefined>((resolve, reject) => {
+          request.onerror = () => reject(request.error);
+          request.onsuccess = () => resolve(request.result);
+        });
+        
+        if (result && result.version === CURRENT_VERSION) {
+          console.log(`✅ Found ${fileName} in IndexedDB`);
+          return new Uint8Array(result.data);
+        }
+      }
     } catch (error) {
-      console.warn('Failed to cache file:', error);
+      console.warn('IndexedDB failed, trying Cache API:', error);
     }
+    
+    // 2. Cache APIから取得を試行
+    const cacheResult = await getCachedFileFromCacheAPI(fileName);
+    if (cacheResult) {
+      console.log(`✅ Found ${fileName} in Cache API`);
+      return cacheResult;
+    }
+    
+    console.log(`❌ No cache found for ${fileName}`);
+    return null;
+  };
+
+  // Cache APIにファイルを保存（フォールバック）
+  const setCachedFileInCacheAPI = async (fileName: string, data: Uint8Array): Promise<void> => {
+    try {
+      if (!isStorageAvailable('cacheAPI')) {
+        return;
+      }
+      
+      const cache = await caches.open('ffmpeg-cache-v1');
+      const response = new Response(data, {
+        headers: {
+          'Content-Type': fileName.endsWith('.wasm') ? 'application/wasm' : 'text/javascript',
+          'Cache-Version': CURRENT_VERSION,
+          'Cache-Timestamp': Date.now().toString()
+        }
+      });
+      
+      await cache.put(`/ffmpeg/${fileName}`, response);
+      console.log(`✅ Cached ${fileName} in Cache API`);
+    } catch (error) {
+      console.warn('Failed to cache file in Cache API:', error);
+    }
+  };
+
+  // ファイルをキャッシュに保存（複数の方法で保存）
+  const setCachedFile = async (fileName: string, data: Uint8Array): Promise<void> => {
+    const promises: Promise<void>[] = [];
+    
+    // 1. IndexedDBに保存を試行
+    if (isStorageAvailable('indexedDB')) {
+      promises.push(
+        (async () => {
+          try {
+            const db = await openDB();
+            const transaction = db.transaction(['files'], 'readwrite');
+            const store = transaction.objectStore('files');
+            await store.put({
+              name: fileName,
+              data: Array.from(data),
+              version: CURRENT_VERSION,
+              timestamp: Date.now()
+            });
+            console.log(`✅ Cached ${fileName} in IndexedDB`);
+          } catch (error) {
+            console.warn('Failed to cache file in IndexedDB:', error);
+          }
+        })()
+      );
+    }
+    
+    // 2. Cache APIに保存を試行
+    promises.push(setCachedFileInCacheAPI(fileName, data));
+    
+    // 並行実行して、どちらかが成功すればOK
+    await Promise.allSettled(promises);
   };
 
   // キャッシュ状態をチェック
   const checkCache = async (): Promise<boolean> => {
     try {
-      const coreFile = await getCachedFile('ffmpeg-core.wasm');
-      const wasmFile = await getCachedFile('ffmpeg-core.js');
-      return coreFile !== null && wasmFile !== null;
-    } catch {
+      console.log('🔍 Checking cache availability...');
+      const coreFile = await getCachedFile('ffmpeg-core.js');
+      const wasmFile = await getCachedFile('ffmpeg-core.wasm');
+      const hasCache = coreFile !== null && wasmFile !== null;
+      console.log(`Cache status: ${hasCache ? '✅ Available' : '❌ Not found'}`);
+      return hasCache;
+    } catch (error) {
+      console.warn('Cache check failed:', error);
       return false;
     }
   };
@@ -93,8 +194,13 @@ export default function VideoToAudioConverter() {
   // キャッシュ状態を保存
   const saveCache = () => {
     try {
-      localStorage.setItem(FFMPEG_VERSION_KEY, CURRENT_VERSION);
-      localStorage.setItem(FFMPEG_CACHE_KEY, 'loaded');
+      if (isStorageAvailable('localStorage')) {
+        localStorage.setItem(FFMPEG_VERSION_KEY, CURRENT_VERSION);
+        localStorage.setItem(FFMPEG_CACHE_KEY, 'loaded');
+        console.log('✅ Cache status saved to localStorage');
+      } else {
+        console.warn('⚠️ localStorage not available, cache status not saved');
+      }
     } catch (error) {
       console.warn('Failed to save cache status:', error);
     }
@@ -103,17 +209,38 @@ export default function VideoToAudioConverter() {
   // キャッシュをクリア
   const clearCache = async () => {
     try {
-      localStorage.removeItem(FFMPEG_VERSION_KEY);
-      localStorage.removeItem(FFMPEG_CACHE_KEY);
+      // localStorage クリア
+      if (isStorageAvailable('localStorage')) {
+        localStorage.removeItem(FFMPEG_VERSION_KEY);
+        localStorage.removeItem(FFMPEG_CACHE_KEY);
+        console.log('✅ localStorage cache cleared');
+      }
       
       // IndexedDBのキャッシュもクリア
-      const db = await openDB();
-      const transaction = db.transaction(['files'], 'readwrite');
-      const store = transaction.objectStore('files');
-      await store.clear();
+      if (isStorageAvailable('indexedDB')) {
+        try {
+          const db = await openDB();
+          const transaction = db.transaction(['files'], 'readwrite');
+          const store = transaction.objectStore('files');
+          await store.clear();
+          console.log('✅ IndexedDB cache cleared');
+        } catch (error) {
+          console.warn('Failed to clear IndexedDB cache:', error);
+        }
+      }
+      
+      // Cache APIのキャッシュもクリア
+      if (isStorageAvailable('cacheAPI')) {
+        try {
+          await caches.delete('ffmpeg-cache-v1');
+          console.log('✅ Cache API cache cleared');
+        } catch (error) {
+          console.warn('Failed to clear Cache API cache:', error);
+        }
+      }
       
       setIsCached(false);
-      console.log('✅ Cache cleared successfully');
+      console.log('✅ All caches cleared successfully');
     } catch (error) {
       console.warn('Failed to clear cache:', error);
     }
@@ -121,7 +248,17 @@ export default function VideoToAudioConverter() {
 
   // 初期化時にキャッシュ状態をチェック
   useEffect(() => {
+    setMounted(true);
     const initCache = async () => {
+      console.log('🚀 Initializing cache check...');
+      console.log('📱 Device info:', {
+        userAgent: navigator.userAgent,
+        localStorage: isStorageAvailable('localStorage'),
+        indexedDB: isStorageAvailable('indexedDB'),
+        cacheAPI: isStorageAvailable('cacheAPI'),
+        private: window.navigator.storage ? 'Persistent' : 'Possibly Private'
+      });
+      
       const cached = await checkCache();
       setIsCached(cached);
       if (cached) {
@@ -133,6 +270,8 @@ export default function VideoToAudioConverter() {
           console.error('Auto-load failed:', error);
           setStatusMessage('自動読み込みに失敗しました。手動で読み込んでください。');
         }
+      } else {
+        console.log('ℹ️ No cache found, manual load required');
       }
     };
     initCache();
@@ -454,16 +593,35 @@ export default function VideoToAudioConverter() {
               </div>
             )}
             
-            {/* キャッシュクリアボタンは常に表示（トラブルシューティング用） */}
-            {isCached && !isFFmpegLoading && (
-              <div className="mt-3 p-2 bg-green-50 border border-green-200 rounded text-green-700 text-sm flex items-center justify-between">
-                <span>⚡ FFmpegキャッシュ済み（自動読み込み中...）</span>
-                <button
-                  onClick={clearCache}
-                  className="text-xs bg-green-100 hover:bg-green-200 px-2 py-1 rounded transition-colors"
-                >
-                  キャッシュクリア
-                </button>
+            {/* ストレージ情報とトラブルシューティング */}
+            {mounted && (
+              <div className="mt-3 text-xs space-y-2">
+                {!isStorageAvailable('localStorage') && (
+                  <div className="p-2 bg-yellow-50 border border-yellow-200 rounded text-yellow-700">
+                    ⚠️ プライベートモードまたはストレージが無効です
+                  </div>
+                )}
+                
+                {/* キャッシュクリアボタンは常に表示（トラブルシューティング用） */}
+                {isCached && !isFFmpegLoading && (
+                  <div className="p-2 bg-green-50 border border-green-200 rounded text-green-700 flex items-center justify-between">
+                    <span>⚡ FFmpegキャッシュ済み（自動読み込み中...）</span>
+                    <button
+                      onClick={clearCache}
+                      className="text-xs bg-green-100 hover:bg-green-200 px-2 py-1 rounded transition-colors"
+                    >
+                      キャッシュクリア
+                    </button>
+                  </div>
+                )}
+                
+                {!isCached && !isFFmpegLoading && (
+                  <div className="p-2 bg-gray-50 border border-gray-200 rounded text-gray-600">
+                    💡 デバッグ情報: {isStorageAvailable('indexedDB') ? 'IndexedDB✅' : 'IndexedDB❌'} | 
+                    {isStorageAvailable('cacheAPI') ? 'Cache API✅' : 'Cache API❌'} | 
+                    {isStorageAvailable('localStorage') ? 'localStorage✅' : 'localStorage❌'}
+                  </div>
+                )}
               </div>
             )}
           </div>
